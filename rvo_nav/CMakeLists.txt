@@ -1,0 +1,61 @@
+#set(CMAKE_CXX__FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+
+set(rvo_nav_IMPLEMENTATIONS
+  thread/threadengine.cpp
+  lcm/lcmthread.cpp
+  lcm/lcmhandler.cpp
+  lcm/timestamped_waypoint_list_handler.cpp
+  beans/node.cpp
+  lcm/protectedmutex.cpp
+  navigation/HRVOAgent.cpp
+  navigation/RVO/Agent.cpp
+  navigation/RVO/Obstacle.cpp
+  navigation/RVO/KdTree.cpp
+  navigation/RVO/RVOSimulator.cpp
+  navigation/Agent.cpp
+  navigation/HRVO/Agent.cpp
+  navigation/HRVO/RoadmapVertex.cpp
+  navigation/HRVO/Vector2.cpp
+  navigation/HRVO/Obstacle.cpp
+  navigation/HRVO/HRVOSimulator.cpp
+  navigation/HRVO/KdTree.cpp
+  navigation/HRVO/Goal.cpp
+  navigation/HLAgent.cpp
+  navigation/ORCAAgent.cpp  )
+  
+include_directories(${CMAKE_SOURCE_DIR}/controllers/rvo_nav/lcm)
+include_directories(${CMAKE_SOURCE_DIR}/controllers/rvo_nav)
+  #include_directories(${cmake_source_dir}/controllers/rvo_nav/lcm)
+if( ARGOS_COMPILE_REAL_SWARMANOID )
+  include_directories(/usr/local/angstrom/arm/include/)
+  link_directories(
+    ${CMAKE_BINARY_DIR}/../../../common/swarmanoid/control_interface
+    ${CMAKE_BINARY_DIR}/../../../common/swarmanoid/utility
+    ${CMAKE_BINARY_DIR}/../../../real_robot/swarmanoid/common
+    ${CMAKE_BINARY_DIR}/../../../real_robot/swarmanoid/vision_robot/filtering
+    ${CMAKE_SOURCE_DIR}/../../real_robot/swarmanoid/opencv/lib
+    ${CMAKE_BINARY_DIR}/../../../real_robot/swarmanoid/footbot
+    )
+  add_library(rvo_nav STATIC
+    ${rvo_nav_IMPLEMENTATIONS}
+    )
+  add_library(rvo_nav_client STATIC
+    client/rvo_nav_client.cpp )
+  target_link_libraries(rvo_nav lcm)
+  target_link_libraries(rvo_nav_client rvo_nav)
+
+else( ARGOS_COMPILE_REAL_SWARMANOID )
+  add_definitions(-fPIC)
+  include_directories(${CMAKE_SOURCE_DIR}/controllers/rvo_nav/lcm)
+  add_library(rvo_nav STATIC
+    ${rvo_nav_IMPLEMENTATIONS}
+    )
+  add_library(rvo_nav_client STATIC
+    client/rvo_nav_client.cpp )
+  target_link_libraries(rvo_nav_client rvo_nav)
+  add_executable(waypointlist_listener lcm/waypointlist_listener.cpp)
+  target_link_libraries(waypointlist_listener lcm)
+endif( ARGOS_COMPILE_REAL_SWARMANOID )
+
+
+

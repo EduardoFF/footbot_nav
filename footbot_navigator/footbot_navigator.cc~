@@ -1,0 +1,1708 @@
+#include "footbot_lql_collector.h"
+
+/** VERY IMPORTANT NOTE 
+ *  In order to allow the controller to generate more messages
+ *  we should increment the number of tick per seconds
+ * */
+
+#ifndef FOOTBOT_LQL_SIM
+#include "timer.h"
+#else
+#include <argos2/simulator/physics_engines/physics_engine.h>
+#endif
+
+
+
+/// to handle debug and report macros
+#define STR_EXPAND(tok) #tok
+#define STR(tok) STR_EXPAND(tok)
+
+/// which log info 
+#define __USE_DEBUG_COMM 0
+#define __USE_DEBUG_NAV 0
+#define __USE_DEBUG_ERROR 1
+
+#if __USE_DEBUG_NAV
+#define DEBUGNAV(m, ...) \
+{\
+  std::string t_str = getTimeStr();\
+  fprintf(stderr, "%s DEBUGNAV[%d]: " m,\
+	  t_str.c_str(),\
+	  (int) m_myID,\
+          ## __VA_ARGS__);\
+  fflush(stderr);\
+}
+#else
+#define DEBUGNAV(m, ...)
+#endif
+
+#if __USE_DEBUG_COMM
+#define DEBUGCOMM(m, ...) \
+{\
+  fprintf(stderr, "%.2f DEBUGCOMM[%d]: " m,\
+	  (float) m_Steps,\
+	  (int) m_myID, \
+          ## __VA_ARGS__);\
+  fflush(stderr);\
+}
+#else
+#define DEBUGCOMM(m, ...)
+#endif
+
+#if __USE_DEBUG_ERROR
+#define DEBUGERROR(m, ...) \
+{\
+  fprintf(stderr, "DEBUGERROR[%d]: " m,\
+	  (int) m_myID,\
+          ## __VA_ARGS__);\
+  fflush(stderr);\
+}
+#else
+#define DEBUGERROR(m, ...)
+#endif
+
+#ifdef FOOTBOT_LQL_SIM
+#define MAX_UDP_SOCKET_BUFFER_SIZE 1200
+#endif
+
+TimestampedConfigMsgHandler *MARSFootbot::m_configHandler =
+  new TimestampedConfigMsgHandler("udpm://239.255.76.67:7667?ttl=1", "CONFIG", true);
+
+#ifdef USE_WP_LIST
+TimestampedWaypointListHandler *MARSFootbot::m_wpControl =
+  new TimestampedWaypointListHandler("udpm://239.255.76.67:7667?ttl=1", 
+				 "TARGET", true);
+#endif
+
+
+MARSFootbot::MARSFootbot() :
+  RandomSeed(12345),
+  m_Steps(0),
+  m_state(STATE_INIT),
+  m_pcWheels(NULL), 
+  m_ledsActuator(NULL), 
+  m_imSending(false),
+  m_targetMinPointDistance(0.12f), 
+  m_pcProximity(NULL), 
+  m_cAlpha(10.0f), 
+  m_fDelta(1.0f), 
+  m_fWheelVelocity(5.0f), 
+  m_cGoStraightAngleRange(-ToRadians(m_cAlpha), 
+			  ToRadians(m_cAlpha)) 
+{
+  m_ledMode=LEDS_MOBILITY;
+  m_beaconMode = BEACON_RECEIVE_BLINK;
+  m_doTargetOrientation = false;
+  m_targetOrientation = 0.0;
+}
+
+  void
+MARSFootbot::stopSending()
+{
+  if( !m_imSending )
+    return;
+#ifndef FOOTBOT_LQL_SIM
+//  m_sendTimer->stop();
+#endif
+  DEBUGCOMM("stop sending!\n");
+  m_imSending = false;
+}
+
+  void
+MARSFootbot::startSending()
+{
+  if( m_imSending )
+    return;
+#ifndef FOOTBOT_LQL_SIM
+  int interval_ms = nextSendInterval();
+  m_sendTimer->startPeriodic(interval_ms);
+#endif
+  DEBUGCOMM("start sending!\n");
+  m_imSending = true;
+#ifdef FOOTBOT_LQL_SIM
+  m_sendIntervalSteps = nextSendInterval();
+#endif
+}
+
+  void
+MARSFootbot::initComm( TConfigurationNode& t_tree )
+{
+  /// some default parameters
+  m_packetSize = 1000;  //! in bytes, default value - read from configuration
+  m_cbrPacketInterval = 200;
+#ifndef FOOTBOT_LQL_SIM
+  m_minPacketInterval = 10; //! in ms
+  m_cbrOnOffToggleLow = 30000;
+  m_cbrOnOffToggleHigh = 60000;
+#else
+#if FOOTBOT_LQL_SIM_USE_NET_INTERVAL
+  m_minPacketInterval = 1;
+#else
+  m_cntSendTime = getTime();
+  m_minPacketInterval = 5;
+#endif
+#endif
+
+  /// Initialize communication
+  DEBUGCOMM("=========== Initializing Comm ========== \n");
+
+  //! get configuration parameters
+  if (NodeExists(t_tree, "comm")) 
+  {
+    TConfigurationNode t_node = GetNode(t_tree, "comm");
+
+    GetNodeAttributeOrDefault(t_node, "packetSize", m_packetSize, m_packetSize);
+    std::string trafficGenType("TRAFFIC_NONE");
+    GetNodeAttributeOrDefault<std::string>(t_node, "trafficGenType", 
+					   trafficGenType, trafficGenType);
+    if (trafficGenType == "TRAFFIC_NONE" )
+      m_trafficGenType = TRAFFIC_NONE;
+    else if( trafficGenType == "TRAFFIC_CBR" )
+      m_trafficGenType = TRAFFIC_CBR;
+    else if( trafficGenType == "TRAFFIC_CBR_NOMOVE" )
+      m_trafficGenType = TRAFFIC_CBR_NOMOVE;
+    else if( trafficGenType == "TRAFFIC_CBR_ONOFF" )
+      m_trafficGenType = TRAFFIC_CBR_ONOFF;
+    else if( trafficGenType == "TRAFFIC_CBR_EVENT_PROXIMITY" )
+      m_trafficGenType = TRAFFIC_CBR_EVENT_PROXIMITY;
+    else
+      m_trafficGenType = TRAFFIC_NONE;
+    DEBUGCOMM("USING TRAFFIC %s %d\n", trafficGenType.c_str(), m_trafficGenType);
+    GetNodeAttributeOrDefault(t_node, "minPacketInterval", 
+			      m_minPacketInterval, m_minPacketInterval);
+    GetNodeAttributeOrDefault(t_node, "cbrPacketInterval", 
+			      m_cbrPacketInterval, m_cbrPacketInterval);
+#ifndef FOOTBOT_LQL_SIM
+    GetNodeAttributeOrDefault(t_node, "cbrOnOffToggleLow", 
+			      m_cbrOnOffToggleLow, m_cbrOnOffToggleLow);
+
+    GetNodeAttributeOrDefault(t_node, "cbrOnOffToggleHigh", 
+			      m_cbrOnOffToggleHigh, m_cbrOnOffToggleHigh);
+#endif
+  } 
+  else
+  {
+    printf("WARNING: Comm has no configuration - using default\n");
+  }
+
+
+  m_receivedPacketsAll = 0;
+  m_sentPackets=0;
+#ifndef FOOTBOT_LQL_SIM
+  m_socketMsg = new char[MAX_UDP_SOCKET_BUFFER_SIZE];
+#else
+  /// this is extremely dangerous, but should work
+  /**
+   * http://stackoverflow.com/questions/7836863/is-there-a-way-to-get-stdstrings-buffer
+   * Every std::string implementation I know of is in fact contiguous
+   * and null-terminates its buffer. So, although it isn’t formally
+   * guaranteed, in practice you can probably get away with calling
+   * &str[0] to get a pointer to a contiguous and null-terminated
+   * string. (But to be safe, you should still use str.c_str().)
+   * */
+  //m_socketMsgStr.reserve(m_packetSize);
+  //m_socketMsg = &m_socketMsgStr[0];
+  /// Fuck off! it is not logical to use strings here,
+  /// I changed the stuff to send char buffers instead
+  m_socketMsg = new char[MAX_UDP_SOCKET_BUFFER_SIZE];
+#endif
+
+  //if( DataRate > 0)
+  //{
+    // SENDER
+    //unsigned int interval = nextInterval();
+    //setNextPacketGen( interval);
+    //		beaconActuator->SetColor(CColor::GREEN);
+  //}
+#ifndef FOOTBOT_LQL_SIM
+//#if 0
+
+  /// Create sending socket
+  if( (m_sendSocket = socket(AF_INET, SOCK_DGRAM, 0)) < 0) 
+  {
+    DEBUGERROR("Opening sending socket\n");
+    exit(-1);
+  }
+
+  /// OPTIONAL: Set socket to allow broadcast
+  int broadcastPermission = 1;
+  if (setsockopt(m_sendSocket, SOL_SOCKET, 
+		 SO_BROADCAST, (void *) &broadcastPermission, 
+		 sizeof(broadcastPermission)) < 0) 
+  {
+    DEBUGERROR("setsockopt() failed while setting broadcast permission\n");
+    exit(-1);
+  }
+
+  //! TODO: make it a parameter in the xml
+  m_remoteHost = "10.42.43.254";
+  m_remotePort = 7788;
+  //m_remoteHost = 
+  /// Fill in the address of the remote host
+  memset(&m_remote_addr, 
+	 0, sizeof(m_remote_addr));
+  m_remote_addr.sin_family = AF_INET;
+  m_remote_addr.sin_port = htons( (short) m_remotePort);
+
+  bool USE_BROADCAST = false;
+  if( USE_BROADCAST )
+  {
+    m_remote_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    DEBUGCOMM("peer addr = BROADCAST, port %d\n",
+	      (int) m_remotePort);
+  } 
+  else
+  {
+    /// Resolve the server address (convert from symbolic name to IP number)
+    struct hostent *host = gethostbyname(m_remoteHost.c_str());
+    if (host == NULL) 
+    {
+      DEBUGERROR("Cannot define host address\n");
+      exit(-1);
+    }
+    // Print a resolved address of server (the first IP of the host)
+    DEBUGCOMM(
+      "peer addr = %d.%d.%d.%d, port %d\n",
+      host->h_addr_list[0][0] & 0xff,
+      host->h_addr_list[0][1] & 0xff,
+      host->h_addr_list[0][2] & 0xff,
+      host->h_addr_list[0][3] & 0xff,
+      (int) m_remotePort
+      );
+    /// Write resolved IP address of a server to the address structure
+    memmove(&(m_remote_addr.sin_addr.s_addr), host->h_addr_list[0], 4);
+  }
+
+  /// Create receiving socket
+  if( (m_recvSocket = socket(AF_INET, SOCK_RAW, IPPROTO_UDP)) < 0) 
+  {
+    DEBUGERROR("Opening receiving socket\n");
+    exit(-1);
+  }
+  /// Fill in the address structure containing self address
+  struct sockaddr_in myaddr;
+  memset(&myaddr, 0, sizeof(struct sockaddr_in));
+  myaddr.sin_family = AF_INET;
+  myaddr.sin_port = htons(m_remotePort);        // Port to listen
+  myaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+  //myaddr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+  /// Bind a socket to the address
+  int res = bind(m_recvSocket, (struct sockaddr*) &myaddr, sizeof(myaddr));
+  if (res < 0) 
+  {
+    DEBUGERROR("Cannot bind a receiving socket\n"); exit(-1);
+  }
+  //! Set the "LINGER" timeout to zero, to close the listen socket
+  //! immediately at program termination.
+  struct linger linger_opt = { 1, 0 }; //! Linger active, timeout 0
+  setsockopt(m_recvSocket, SOL_SOCKET, SO_LINGER, &linger_opt, sizeof(linger_opt));
+
+  // Include IP Header
+  int on = 1;
+  setsockopt(m_recvSocket, IPPROTO_IP, IP_HDRINCL, &on, sizeof(on));
+  m_rcvMsg = new char[MAX_UDP_SOCKET_BUFFER_SIZE];
+
+
+  m_sendTimer = new Timer(TIMER_MILLISECONDS, 
+			  timerCB,
+			  (void *) this);
+
+
+  /*
+   *************************************************
+   * END OF: Initialize communication
+   *************************************************
+   */
+//#endif
+#else
+  m_pcWifiSensor = dynamic_cast<CCI_WiFiSensor* >(GetRobot().GetSensor("wifi"));
+  m_pcWifiActuator = dynamic_cast<CCI_WiFiActuator* >(GetRobot().GetActuator("wifi"));
+#endif
+  if( m_trafficGenType == TRAFFIC_CBR ||
+      m_trafficGenType == TRAFFIC_CBR_NOMOVE ||
+      m_trafficGenType == TRAFFIC_CBR_EVENT_PROXIMITY )
+    startSending();
+  if( m_trafficGenType == TRAFFIC_CBR_ONOFF )
+  {
+#ifndef FOOTBOT_LQL_SIM
+    m_cbrOnOffTimer = new Timer(TIMER_MILLISECONDS, 
+				cbrOnOffCB,
+				(void *) this);
+    unsigned int cbr_interval = 
+     nextCBROnOffToggleInterval(); 
+    //m_cbrOnOffTimer->startOneShot(cbr_interval);
+    m_cbrOnOffTimer->startPeriodic(cbr_interval);
+#else
+   
+    DEBUGERROR("CBR not in sim");
+    exit(-1);
+#endif
+  }
+
+}
+
+  bool 
+MARSFootbot::isNodeValid( Node &n )
+{
+#ifndef FOOTBOT_LQL_SIM
+  UInt64 dt = getTime() - n.getTimestamp();
+  return (dt < NODE_VALIDITY_THRESHOLD);
+#else
+  /// in simulation, assume everything is valid
+  /// i.e., we do not lose track of the robots
+  return true;
+#endif
+}
+
+void 
+MARSFootbot::setLeds()
+{
+  if( m_ledMode == LEDS_MOBILITY )
+  {
+    switch (m_state )
+    {
+    case STATE_INIT_READY:
+      m_ledsActuator->SetAllColors(CColor::BLUE);
+      break;
+    case STATE_ARRIVED_AT_TARGET:
+      m_ledsActuator->SetAllColors(CColor::RED);
+      break;
+    case STATE_MOVING:
+      m_ledsActuator->SetAllColors(CColor::GREEN);
+      break;
+    case STATE_ORIENTING:
+      m_ledsActuator->SetAllColors(CColor::YELLOW);
+      break;
+    default:
+      break;
+    }
+  }
+  else if( m_ledMode == LEDS_FIXED )
+  {
+    m_ledsActuator->SetAllColors(m_ledFixedColor);
+  }
+}
+
+void
+MARSFootbot::setBeacon()
+{
+  if( m_beaconMode == BEACON_MOBILITY || 
+      m_beaconMode == BEACON_MOBILITY_LETTER_DEMO )
+  {
+    switch (m_state )
+    {
+    case STATE_INIT_READY:
+      m_beaconActuator->SetColor(CColor::BLUE);
+      break;
+    case STATE_ARRIVED_AT_TARGET:
+      if( m_beaconMode == BEACON_MOBILITY_LETTER_DEMO )
+      {
+	/// check if it is outside area
+	position = CVector2(mySelf.getPosition().GetX(), mySelf.getPosition().GetY());
+	if( position.GetX() < -0.3 ||
+	    position.GetY() < -0.3 )
+	{
+	  m_beaconActuator->SetColor(CColor::BLACK);
+	}
+	else
+	{
+	  m_beaconActuator->SetColor(CColor::RED);
+	}
+      }
+      else
+      {
+	m_beaconActuator->SetColor(CColor::RED);
+      }
+      break;
+    case STATE_MOVING:
+      m_beaconActuator->SetColor(CColor::GREEN);
+      break;
+    case STATE_ORIENTING:
+      m_beaconActuator->SetColor(CColor::YELLOW);
+      break;
+    default:
+      break;
+    }
+  } 
+  else if( m_beaconMode == BEACON_RECEIVE_BLINK )
+  {
+
+  }
+
+}
+
+
+  void 
+MARSFootbot::setState(RobotNavState s)
+{
+  if( s == m_state )
+    return;
+  /// change of state
+  m_state = s;
+  if( s == STATE_ARRIVED_AT_TARGET || s == STATE_INIT_READY)
+  {
+    setLeds();
+    setBeacon();
+    /// start sending
+    if( m_trafficGenType == TRAFFIC_CBR_NOMOVE )
+    {
+      //startSending();
+      m_imSending = true;
+    }
+  }
+  if( s == STATE_MOVING || s == STATE_ORIENTING)
+  {
+    setLeds();
+    setBeacon();
+    /// stop sending 
+    if( m_trafficGenType == TRAFFIC_CBR_NOMOVE )
+    {
+     // stopSending();
+     m_imSending = false;
+    }
+
+  }
+
+}
+
+  void 
+MARSFootbot::Init(TConfigurationNode& t_node) 
+{
+  /// The first thing to do, set my ID
+#ifdef FOOTBOT_LQL_SIM
+  m_myID = 
+    atoi(GetRobot().GetRobotId().substr(3).c_str());
+#else
+  m_myID = 
+    atoi(GetRobot().GetRobotId().substr(7).c_str());
+#endif
+  printf("MyID %d\n", m_myID);
+  /// Get actuators and sensors
+  m_pcWheels = dynamic_cast<CCI_FootBotWheelsActuator*>(GetRobot().GetActuator("footbot_wheels"));
+  m_ledsActuator = dynamic_cast<CCI_FootBotLedsActuator*>(GetRobot().GetActuator("footbot_leds"));
+  m_pcProximity = dynamic_cast<CCI_FootBotProximitySensor*>(GetRobot().GetSensor("footbot_proximity"));
+  //rangeAndBearingActuator = 
+  //dynamic_cast<CCI_RangeAndBearingActuator*> (GetRobot().GetActuator("range_and_bearing"));
+  m_beaconActuator          = dynamic_cast<CCI_FootBotBeaconActuator*>   (GetRobot().GetActuator("footbot_beacon"));
+  //rangeAndBearingSensor   = 
+  //dynamic_cast<CCI_RangeAndBearingSensor*>   (GetRobot().GetSensor  ("range_and_bearing"));
+
+  /// Random
+  GetNodeAttributeOrDefault(t_node, "RandomSeed", RandomSeed, RandomSeed);
+
+  /// distance threshold to determine that robot reached target point
+  //GetNodeAttributeOrDefault(t_node, "targetMinPointDistance", m_targetMinPointDistance, m_targetMinPointDistance);
+  std::string text;
+
+  if (NodeExists(t_node, "targetMinPointDistance")) 
+  {
+    GetNodeText(GetNode(t_node, "targetMinPointDistance"), text);
+    sscanf(text.c_str(), "%f", &m_targetMinPointDistance);
+    //m_targetMinPointDistance = fmin(MAX_RESOLUTION, m_targetMinPointDistance);
+  }
+
+  DEBUGNAV("Min distance to target point %f in robot %s\n", 
+	   m_targetMinPointDistance, GetRobot().GetRobotId().c_str());
+
+  if (NodeExists(t_node, "originAreaX")) 
+  {
+    GetNodeText(GetNode(t_node, "originAreaX"), text);
+    sscanf(text.c_str(), "%f", &originAreaX);
+  }
+
+  if (NodeExists(t_node, "originAreaY")) 
+  {
+    GetNodeText(GetNode(t_node, "originAreaY"), text);
+    sscanf(text.c_str(), "%f", &originAreaY);
+  }
+
+  if (NodeExists(t_node, "destinationAreaX")) {
+    GetNodeText(GetNode(t_node, "destinationAreaX"), text);
+    sscanf(text.c_str(), "%f", &destinationAreaX);
+  }
+
+  if (NodeExists(t_node, "destinationAreaY")) {
+    GetNodeText(GetNode(t_node, "destinationAreaY"), text);
+    sscanf(text.c_str(), "%f", &destinationAreaY);
+  }
+
+  DEBUGNAV("Area bounds-> ORIGIN (%f,%f), DESTINATION (%f,%f)\n", 
+	   originAreaX, originAreaY, destinationAreaX, destinationAreaY);
+  originAreaCoord.SetX(originAreaX);
+  originAreaCoord.SetY(originAreaY);
+  destinationAreaCoord.SetX(destinationAreaX);
+  destinationAreaCoord.SetY(destinationAreaY);
+
+  CARGoSRandom::CreateCategory("local_rng", RandomSeed);
+  RandomGen = CARGoSRandom::CreateRNG("local_rng");
+
+  printf("checking for led conf\n");
+  if (NodeExists(t_node, "ledcontrol")) 
+  {
+    printf("NODE EXISTS LEDS\n");
+    TConfigurationNode node = GetNode(t_node, "ledcontrol");
+    string ledMode("DEFAULT");
+    GetNodeAttributeOrDefault<std::string>(node, "mode", ledMode, ledMode);
+    if ( ledMode == "DEFAULT" )
+      m_ledMode = LEDS_NONE;
+    else if ( ledMode == "MOBILITY" )
+      m_ledMode = LEDS_MOBILITY;
+    else if ( ledMode == "FIXED" )
+      m_ledMode = LEDS_FIXED;
+    else if ( ledMode=="RECEIVE_BLINK" )
+      m_ledMode = LEDS_RECEIVE_BLINK;
+    else
+      m_ledMode = LEDS_NONE;
+
+    string ledFixedColor("black");
+    GetNodeAttributeOrDefault<std::string>(node, "fixedColor", 
+					   ledFixedColor, ledFixedColor);
+    stringstream ss(ledFixedColor);
+    ss >> m_ledFixedColor;
+    cout << "ledMode " << ledMode << " fcolor " << ledFixedColor << endl;
+  }
+  else
+  {
+    printf("NO LED CONF WTF\n");
+  }
+
+  printf("checking for beacon conf\n");
+  if (NodeExists(t_node, "beaconcontrol")) 
+  {
+    printf("NODE EXISTS BEACON\n");
+    TConfigurationNode node = GetNode(t_node, "beaconcontrol");
+    string beaconMode("DEFAULT");
+    GetNodeAttributeOrDefault<std::string>(node, "mode", beaconMode, beaconMode);
+    if ( beaconMode == "DEFAULT" )
+      m_beaconMode = BEACON_NONE;
+    else if ( beaconMode == "MOBILITY" )
+      m_beaconMode = BEACON_MOBILITY;
+    else if ( beaconMode == "MOBILITY_LETTER_DEMO" )
+      m_beaconMode = BEACON_MOBILITY_LETTER_DEMO;
+    else if ( beaconMode == "FIXED" )
+      m_beaconMode = BEACON_FIXED;
+    else if ( beaconMode=="RECEIVE_BLINK" )
+      m_beaconMode = BEACON_RECEIVE_BLINK;
+    else
+      m_beaconMode = BEACON_NONE;
+
+    string beaconFixedColor("black");
+    GetNodeAttributeOrDefault<std::string>(node, "fixedColor", 
+					   beaconFixedColor, beaconFixedColor);
+    stringstream ss(beaconFixedColor);
+    ss >> m_beaconFixedColor;
+    cout << "beaconMode " << beaconMode << " fcolor " << beaconFixedColor << endl;
+  }
+  else
+  {
+    printf("NO beacon CONF WTF\n");
+  }
+
+  fflush(stdout);
+  setLeds();
+  setBeacon();
+
+
+  /** LCM engine */
+  /// LCM Thread
+  std::string track_chan("TRACK");
+  std::string target_chan("TARGET");
+  if (NodeExists(t_node, "lcm")) 
+  {
+    TConfigurationNode node = GetNode(t_node, "lcm");
+    GetNodeAttributeOrDefault<std::string>(node, "track", track_chan, track_chan);
+  }
+  else
+  {
+    printf("NO LCM CONF\n");
+  }
+  printf("Listening to %s\n", track_chan.c_str());
+#ifndef USE_WP_LIST
+  lcmThreadCommand.setLCMEngine("udpm://239.255.76.67:7667?ttl=1", "TARGET");
+  lcmThreadCommand.startInternalThread();
+#else
+  //m_wpControl = 
+  //new TimestampedWaypointListHandler("udpm://239.255.76.67:7667?ttl=1", 
+  //	       "TARGET");
+//  if( !m_wpControl->run() )
+//    DEBUGERROR("error while running waypoint control\n");
+#endif
+
+  lcmThread.setLCMEngine("udpm://239.255.76.67:7667?ttl=1", track_chan.c_str());
+  lcmThread.startInternalThread();
+  /** NAVIGATION AND AVOIDING COLLISION */
+  /* Additional sensors */
+  // we do not have encoderSensor in simulation
+  encoderSensor = dynamic_cast<CCI_FootBotEncoderSensor*>(GetRobot().GetSensor("footbot_encoder"));
+
+ 
+  //! init comm first
+  initComm(t_node);
+  DEBUGCOMM("======== Comm initialized ============\n");
+  /// Init navigation methods 
+  initOdometry();
+  initLocalNavigation(t_node);
+
+#ifndef FOOTBOT_LQL_SIM
+  initClick();
+#endif
+
+  // m_configHandler =
+  //   new TimestampedConfigMsgHandler("udpm://239.255.76.67:7667?ttl=1", "CONFIG");
+  // if( !m_configHandler->run() )
+  //   DEBUGERROR("error while running config control\n");
+
+  setState(STATE_INIT_READY);
+}
+
+void
+MARSFootbot::processConfig(std::string msg)
+{
+  std::stringstream ss(msg);
+  std::string cmd;
+  ss >> cmd;
+  cout << "got config cmd " << cmd << endl;
+  if( cmd == "SET_DATARATE" )
+    {
+      double rate;
+      ss >> rate;
+      /// convert to B/s
+      setCBRPacketInterval(rate * 1000.0 );
+    }
+  if( cmd == "CLEAR_EVENTS" )
+    {
+      m_cbrEvents.clear();
+    }
+  if( cmd == "ADD_EVENT")
+    {
+      double x,y,z;
+      int min_dist,max_dist, min_rate, max_rate;
+      ss >> x >> y >> z >> min_dist >> max_dist >> min_rate >> max_rate;
+      CBREvent cbe(x,y,z,min_dist, max_dist, min_rate, max_rate);
+      m_cbrEvents.push_back(cbe);
+    }
+}
+
+  void 
+MARSFootbot::ControlStep() 
+{
+
+  CRadians oA;
+  CVector3 axis;
+  
+  m_Steps+=1;
+  std::pair< bool, TimestampedConfigMsg> c_msg =
+    m_configHandler->popNextConfigMsg(m_myID, getTime());
+  //printf("RobotId %d ControlStep %lld - config msgs? %d\n",
+  //	 m_myID, m_Steps, c_msg.first);
+  if( c_msg.first )
+  {
+    //cout << "robot " << m_myID <<  " time "
+    //	 << getTime() << "config? " << c_msg.first
+    //	 << " msg.timestamp: " << c_msg.second.timestamp << endl;
+    processConfig(c_msg.second.msg);
+  }
+  
+  /// New target point from the COMMAND engine
+#ifdef USE_WP_LIST
+  std::pair< bool, TimestampedWaypoint> c_wp =
+    m_wpControl->getNextWaypoint(m_myID,getTime());
+  if( c_wp.first )
+  {
+    CVector2 n_wp(c_wp.second.second.GetX(), c_wp.second.second.GetY());
+    Real n_ori = c_wp.second.second.GetYaw();
+    if( m_targetPosition != n_wp || m_targetOrientation != n_ori)    
+    {
+      DEBUGNAV("NEW_WP (%f,%f):%d valid from %llu\n", 
+	       n_wp.GetX(), n_wp.GetY(), n_ori, c_wp.second.first);
+      m_targetPosition.Set( n_wp.GetX(), n_wp.GetY());
+      m_targetOrientation = n_ori;
+    }
+  } 
+  else
+  {
+    /// just stay in same pos
+    if (lcmThread.getLcmHandler()->existNode(m_myID)) 
+    {
+      Node nodeCommand = 
+	lcmThread.getLcmHandler()->getNodeById(m_myID);
+      m_targetPosition.Set(nodeCommand.getPosition().GetX(), 
+			 nodeCommand.getPosition().GetY());
+
+      nodeCommand.getOrientation().ToAngleAxis(oA, axis);
+      if (axis.GetZ() < 0)
+	oA = -oA;
+      m_targetOrientation = ToDegrees(oA).GetValue();
+      DEBUGNAV("REMAIN_IN_POS: (%f,%f): %f\n", 
+	     m_targetPosition.GetX(), 
+	     m_targetPosition.GetY(),
+	     m_targetOrientation);
+    }
+  }
+#else
+  if (lcmThreadCommand.getLcmHandler()->existNode(m_myID)) 
+  {
+    Node nodeCommand = 
+      lcmThreadCommand.getLcmHandler()->getNodeById(m_myID);
+    m_targetPosition.Set(nodeCommand.getPosition().GetX(), 
+		       nodeCommand.getPosition().GetY());
+    DEBUGNAV("ID %d - SET_TARGET: (%f,%f)\n", 
+	   (int) m_myID, 
+	   nodeCommand.getPosition().GetX(), 
+	   nodeCommand.getPosition().GetY());
+  } 
+  else 
+  {
+    if (lcmThread.getLcmHandler()->existNode(m_myID)) 
+    {
+      Node nodeCommand = 
+	lcmThread.getLcmHandler()->getNodeById(m_myID);
+      m_targetPosition.Set(nodeCommand.getPosition().GetX(), 
+			 nodeCommand.getPosition().GetY());
+      DEBUGNAV("ID %d - REMAIN_IN_POS: (%f,%f)\n", 
+	     (int) m_myID, 
+	     nodeCommand.getPosition().GetX(), 
+	     nodeCommand.getPosition().GetY());
+    }
+  }
+#endif
+
+  //DEBUGNAV("Min distance: %f\n", m_targetMinPointDistance);
+
+  /*  */
+  if (lcmThread.getLcmHandler()->existNode(m_myID)) 
+  {
+    DEBUGNAV("lcmThread has my INFO (%d)\n", m_myID);
+
+#if __USE_DEBUG_NAV
+    lcmThread.getLcmHandler()->printNodeListElements();
+#endif
+
+    /** LCM related Node information */
+    //To get the other nodes locations through LCM
+    listNodeObstacles = lcmThread.getLcmHandler()->retrieveNodeList();
+
+    //DEBUGNAV("got NodeList\n");
+    //Get myself
+
+    //mySelf = lcmThread.getLcmHandler()->getNodeById(0);
+    mySelf = lcmThread.getLcmHandler()->getNodeById(m_myID);
+    //DEBUGNAV("Got myself\n");
+
+    //DEBUGNAV("ID %d\n", (int) mySelf.getId());
+    //DEBUGNAV("POS (%f,%f)\n", mySelf.getPosition().GetX(), mySelf.getPosition().GetY());
+    //DEBUGNAV("QUAT (%f,%f,%f,%f)\n", mySelf.getOrientation().GetW(), mySelf.getOrientation().GetX(), mySelf.getOrientation().GetY(), mySelf.getOrientation().GetZ());
+    //DEBUGNAV("VEL %d\n", mySelf.getVelocity());
+
+    mySelf.getOrientation().ToAngleAxis(oA, axis);
+    //DEBUGNAV("0...\n");
+    if (axis.GetZ() < 0)
+      oA = -oA;
+    //DEBUGNAV("1...\n");
+
+    //DEBUGNAV("[CONTROLLER] ID %d - ORIENTATION: (yaw) - (%f) - (%fº)\n", 
+	   //m_myID, oA.GetValue(), ToDegrees(oA).GetValue());
+
+    //DEBUGNAV("[CONTROLLER] AN %d - Previous (%f,%f) - New (%f,%f)\n", 
+	   //m_myID, mySelf.getPosition().GetX(), 
+	   //mySelf.getPosition().GetY(), 
+	   //m_targetPosition.GetX(), 
+	   //m_targetPosition.GetY());
+
+    // Position
+    position = CVector2(mySelf.getPosition().GetX(), mySelf.getPosition().GetY());
+    // Angle
+    angle = oA;
+
+    // Velocity
+    //velocity = CVector2(speed, 0);
+    velocity = CVector2(mySelf.getVelocity(), 0);
+
+    /** NAVIGATION AND AVOIDING COLLISION */
+
+    updateAgent(agent);
+    agent->clearObstacles();
+    addNodesAsObstacles(listNodeObstacles);
+
+    if ((m_targetPosition - position).Length() < m_targetMinPointDistance) 
+    {
+      if( m_doTargetOrientation )
+      {
+	Real oAd = ToDegrees(oA).GetValue();
+	if ( oAd < 0 )
+	  oAd = 360.0 + oAd;
+	/// now, make them between -PI and PI
+	if( oAd > 180.0)
+	  oAd = oAd - 360.0;
+	/// distance between angles
+	Real cdev = m_targetOrientation - oAd;
+	cdev += (cdev>180) ? -360 : (cdev<-180) ? 360 : 0;
+	//Real cdev = fabs(m_targetOrientation - oAd);
+	//printf("STATE_ORIENTING cdev %f\n", cdev);
+	//printf("current orient %f target orient %f cdev %f\n", 
+	 //      oAd, m_targetOrientation, cdev );
+	if( fabs(cdev)  < 5.0 ) 
+	  setState( STATE_ARRIVED_AT_TARGET );
+	else
+	  setState( STATE_ORIENTING );
+      }	
+      else
+      {
+	setState( STATE_ARRIVED_AT_TARGET );
+      }
+      DEBUGNAV("State: STOPPED\n");
+    } 
+    else 
+    {
+      setState( STATE_MOVING );
+      DEBUGNAV("State: MOVING\n");
+    }
+
+    updateNavigation();
+
+    /** END OF NAVIGATION */
+
+  }
+
+#ifndef FOOTBOT_LQL_SIM
+  updateClick();
+  GetNetMessages();
+#else
+  #if FOOTBOT_LQL_SIM_USE_NET_INTERVAL
+  /// in simulation, we should send packets here
+  /// what's the packet size in RoboNetSim?
+  if( m_imSending && m_myID != 1) // only 1 sends
+    {
+      m_sendIntervalSteps--;
+      if(m_sendIntervalSteps<=0 )
+	{
+	  /// ficticious dest
+	  int dest = 1;
+	  std::stringstream ss;
+	  ss << "fb_" << dest;
+	  string strdest = ss.str();
+
+	  makeMsg();
+	  DEBUGCOMM("Sending MSG of size %d to %d (%s)\n", 
+		    m_packetSize, dest, strdest.c_str()); 
+	  m_pcWifiActuator->SendBinaryMessageTo(strdest, (char*)m_socketMsg, m_packetSize);
+	  m_sentPackets++;
+	  DEBUGCOMM("MSG SENT\n");
+	  m_sendIntervalSteps = nextSendInterval();;
+	}
+    }
+#else
+  if( m_imSending )
+    {
+      /// generate msgs during this control loop
+      /// be careful because if the sendInterval is to long
+      /// it might lead to errors
+      int endTime = (m_Steps+1)*CPhysicsEngine::GetSimulationClockTick()*1000;
+      while( m_cntSendTime < endTime )
+	{
+	  int next_int = nextSendInterval();
+	  m_cntSendTime += next_int;
+	  int delay = m_cntSendTime - getTime();
+	  /// ficticious dest
+	  int dest = 1;
+	  std::stringstream ss;
+	  ss << "fb_" << dest;
+	  string strdest = ss.str();
+	  makeMsg();
+	  DEBUGCOMM("Sending MSG of size %d to %d (%s)\n", 
+		    m_packetSize, dest, strdest.c_str()); 
+	  m_pcWifiActuator->SendBinaryMessageTo(strdest, (char*)m_socketMsg,
+						m_packetSize, delay);
+	  m_sentPackets++;
+	  DEBUGCOMM("MSG SENT\n");
+	}      
+    }
+#endif
+  TMessageList t_incomingMsgs;
+  m_pcWifiSensor->GetReceivedMessages(t_incomingMsgs);
+  if( t_incomingMsgs.size())
+    DEBUGCOMM("Received %d messages\n", (int) t_incomingMsgs.size());
+
+  for(TMessageList::iterator it = t_incomingMsgs.begin(); it!=t_incomingMsgs.end();it++)
+  {
+    m_receivedPackets[it->Sender]++;
+    m_receivedPacketsAll++;
+  }
+#endif
+  /// other updates
+  /// event proximity, update every 5 steps
+  ///
+  if( m_trafficGenType == TRAFFIC_CBR_EVENT_PROXIMITY && (m_Steps % 5 == 0))
+    {
+      UInt32 new_rate = TRAFFIC_EVENT_MIN_RATE;
+	
+      DEBUGCOMM("checking %ld events - my current position (%.2f, %.2f) \n",
+		m_cbrEvents.size(), position.GetX(), position.GetY());
+      for( std::list<CBREvent>::iterator it = m_cbrEvents.begin();
+	   it!=m_cbrEvents.end(); it++)
+	{
+	  CBREvent &ev = *it;
+	  //! we need to convert to meters
+	  CVector2 epos( ev.pos.GetX() / 1000.0,
+			 ev.pos.GetY() / 1000.0 );
+	  //! and back to millimeters
+	  double distance_to_event = (epos - position).Length() * 1000.0;
+	  DEBUGCOMM("distance_to_event (%.2f, %.2f) is  %.2f\n",
+		    ev.pos.GetX(), ev.pos.GetY(), distance_to_event);
+	  if (distance_to_event < ev.max_dist )
+	    {
+	      UInt32 ev_rate = ev.max_rate;
+	      if( distance_to_event > ev.min_dist )
+		{
+		  ev_rate = (UInt32 ) ceil ( ev.max_rate  
+					    - ( 1.0*(distance_to_event - ev.min_dist ) / (ev.max_dist - ev.min_dist) )
+					    * (ev.max_rate - ev.min_rate)
+					    );
+		}
+	      new_rate = max(new_rate, ev_rate);
+	      DEBUGCOMM("event_rate %d new_rate %d\n", ev_rate, new_rate); 
+	    }
+	}
+      setCBRPacketInterval(new_rate);
+      //m_cbrPacketInterval = 
+	
+      
+    }
+  /** PROXIMITY SENSORS  */
+  //Does not work properly :(
+  //updateVelocityProximitySensors();
+}
+
+
+//! rate: in B/s
+//! sets the cbrPacketInterval (millisec)
+void
+  MARSFootbot::setCBRPacketInterval(double rate)
+{
+  if( fabs(rate) < EPSILON )
+    {
+      m_cbrPacketInterval = 100000;
+      DEBUGCOMM("setCBRPacketInterval rate: %.2f NOT_SENDING cbrPacketInterval: %d\n",
+		rate, m_cbrPacketInterval);      
+      stopSending();
+    }
+  else
+    {
+      m_cbrPacketInterval = (int) ceil( 1000.0 * m_packetSize / rate);
+      DEBUGCOMM("set cbr interval for data rate %.2f B/s new_interval = %d\n",
+		rate, m_cbrPacketInterval);
+      startSending();
+    }
+}
+#ifndef FOOTBOT_LQL_SIM
+unsigned int 
+MARSFootbot::nextCBROnOffToggleInterval()
+{
+  unsigned int ni = 
+    m_cbrOnOffToggleLow + random()%(m_cbrOnOffToggleHigh-m_cbrOnOffToggleLow);
+  return ni;
+}
+#endif
+
+
+//! it returns the send interval in ms,
+//! if FOOTBOT_LQL_SIM_USE_NET_INTERVAL
+//! it returns in control steps
+int 
+MARSFootbot::nextSendInterval()
+{
+#ifdef FOOTBOT_LQL_SIM
+#if FOOTBOT_LQL_SIM_USE_NET_INTERVAL
+  /// in control steps
+  int ms_tick = CPhysicsEngine::GetSimulationClockTick()*1000;
+  if( m_cbrPacketInterval < ms_tick)
+    DEBUGCOMM("m_cbrPacketInterval (%d) < control step", m_cbrPacketInterval);
+  int send_interval = m_cbrPacketInterval / ms_tick;
+#else
+  /// in milliseconds
+  int send_interval; 
+  if( m_trafficGenType == TRAFFIC_CBR || 
+      m_trafficGenType == TRAFFIC_CBR_NOMOVE ||
+      m_trafficGenType == TRAFFIC_CBR_EVENT_PROXIMITY )
+    send_interval = m_cbrPacketInterval + (random()%5) - 2;
+#endif
+#else
+  /// in milliseconds
+  int send_interval; 
+  if( m_trafficGenType == TRAFFIC_CBR || 
+      m_trafficGenType == TRAFFIC_CBR_NOMOVE)
+    send_interval = m_cbrPacketInterval + (random()%10-5);
+  
+#endif
+  if( send_interval < m_minPacketInterval)
+  {
+    DEBUGCOMM("send_interval %d < min_packet_interval %d", 
+	      send_interval, m_minPacketInterval);
+    send_interval = m_minPacketInterval ;
+  }
+  DEBUGCOMM("nextSendInterval %d\n", send_interval);
+  return send_interval;
+}
+
+  void 
+MARSFootbot::initLocalNavigation(TConfigurationNode& t_node) 
+{
+  hlAgent.Init(t_node);
+  hlAgent.axisLength = axisLength;
+  orcaAgent.Init(t_node);
+  orcaAgent.axisLength = axisLength;
+  hrvoAgent.Init(t_node);
+  hrvoAgent.axisLength = axisLength;
+
+  localNavigationType = "HL";
+
+  if (NodeExists(t_node, "local_navigation")) 
+  {
+    TConfigurationNode node = GetNode(t_node, "local_navigation");
+    if (node.HasAttribute("type"))
+      GetNodeAttribute(node, "type", localNavigationType);
+    GetNodeAttributeOrDefault(node, "doTargetOrientation", 
+			      m_doTargetOrientation, 
+			      m_doTargetOrientation);
+    GetNodeAttributeOrDefault(node, "targetOrientation", 
+			      m_targetOrientation, 
+			      m_targetOrientation);
+
+  }
+
+  if (localNavigationType == "HL") 
+  {
+    localNavigationIndex = 2;
+    setAgent(hlAgent);
+  } 
+  else if (localNavigationType == "ORCA") 
+  {
+    localNavigationIndex = 0;
+    setAgent(orcaAgent);
+  } 
+  else if (localNavigationType == "HRVO") 
+  {
+    localNavigationIndex = 0;
+    setAgent(hrvoAgent);
+  } 
+  else 
+  {
+    throw "Navigation type not defined!";
+    return;
+  }
+}
+
+  void 
+MARSFootbot::initOdometry() 
+{
+  position = CVector2(0, 0);
+  angle = CRadians(0);
+  velocity = CVector2(0, 0);
+  axisLength = encoderSensor->GetReading().WheelAxisLength * 0.01;
+  DEBUGNAV("INIT axis length %.3f", axisLength);
+
+}
+
+  void 
+MARSFootbot::setAgent(Agent &a) 
+{
+  if (agent == &a)
+    return;
+  agent = &a;
+}
+
+  void 
+MARSFootbot::updateAgent(Agent *a) 
+{
+  a->position = position;
+  a->velocity = velocity;
+  a->angularSpeed = angularSpeed;
+  //a->leftWheelSpeed=leftWheelSpeed;
+  //a->rightWheelSpeed=rightWheelSpeed;
+  a->angle = angle;
+}
+
+  void 
+MARSFootbot::addNodesAsObstacles(map<UInt8, Node> listNodeObstacles) 
+{
+  /// Aux variables
+  CVector2 auxPosition;
+  CVector2 auxVelocity;
+
+  /// Create a list of Nodes
+  for (map<UInt8, Node>::iterator it = listNodeObstacles.begin(); 
+       it != listNodeObstacles.end(); it++) 
+  {
+    // I'm not and obstacle for myself!
+    if ((it->second).getId() != mySelf.getId()) 
+    {
+
+      //printf("Agent \n");
+      auxPosition.Set((it->second).getPosition().GetX(), 
+		      (it->second).getPosition().GetY());
+      auxVelocity.Set((it->second).getVelocity(), 0);
+
+      // For a dynamic obstacle we need to use the addObstacleAtPoint(position,velocity,radius)
+      //agent->addObstacleAtPoint(auxPosition, OBSTACLE_RADIUS);
+      agent->addObstacleAtPoint(auxPosition, auxVelocity, OBSTACLE_RADIUS);
+
+      //DEBUGNAV("Adding obstacle : %d\n", (it->second).getId());
+    }
+  }
+  /// Init fixed obstacles
+  setFixedObstacles(addAreaBounds(originAreaCoord, destinationAreaCoord));
+}
+
+  std::vector<CVector2> 
+MARSFootbot::addAreaBounds(CVector2 bottomLeftCoord, CVector2 upperRightCoord) 
+{
+
+  //All obstacle points
+  std::vector<CVector2> obstaclePoints;
+
+  CVector2 upperLeftCoord;
+  upperLeftCoord.Set(bottomLeftCoord.GetX(), upperRightCoord.GetY());
+
+  CVector2 bottomRightCoord;
+  bottomRightCoord.Set(upperRightCoord.GetX(), bottomLeftCoord.GetY());
+
+  //	printf("Vertices (%f,%f),(%f,%f),(%f,%f),(%f,%f)\n", bottomLeftCoord.GetX(), bottomLeftCoord.GetY(), upperLeftCoord.GetX(), upperLeftCoord.GetY(), upperRightCoord.GetX(), upperRightCoord.GetY(),
+  //			bottomRightCoord.GetX(), bottomRightCoord.GetY());
+
+  //Distance from bottom left to upper left.
+  CVector2 d1;
+  d1 = upperLeftCoord - bottomLeftCoord;
+
+  //	printf("D1 %f\n", d1.Length());
+
+  double numObsD1;
+  modf(d1.Length() / (2 * OBSTACLE_RADIUS), &numObsD1);
+  double interDistanceD1 = d1.Length() / numObsD1;
+
+  CVector2 pointAux;
+  pointAux.SetX(bottomLeftCoord.GetX());
+  for (int i = 0; i < numObsD1; i++) {
+    pointAux.SetY(bottomLeftCoord.GetY() + i * interDistanceD1);
+
+    //		printf("D1, P(%d) = (%f,%f)\n", i, pointAux.GetX(), pointAux.GetY());
+    obstaclePoints.push_back(pointAux);
+  }
+
+  //Distance from upper left to upper right
+  CVector2 d2;
+  d2 = upperLeftCoord - upperRightCoord;
+  //printf("D2 %f\n", d2.Length());
+
+  double numObsD2;
+  modf(d2.Length() / (2 * OBSTACLE_RADIUS), &numObsD2);
+  double interDistanceD2 = d2.Length() / numObsD2;
+
+  pointAux.SetY(upperLeftCoord.GetY());
+  for (int i = 0; i < numObsD2; i++) {
+    pointAux.SetX(upperLeftCoord.GetX() + i * interDistanceD2);
+
+    //printf("D2, P(%d) = (%f,%f)\n", i, pointAux.GetX(), pointAux.GetY());
+    obstaclePoints.push_back(pointAux);
+  }
+
+  //Distance from upper right to bottom right
+  CVector2 d3;
+  d3 = upperRightCoord - bottomRightCoord;
+  //printf("D3 %f\n", d3.Length());
+
+  double numObsD3;
+  modf(d3.Length() / (2 * OBSTACLE_RADIUS), &numObsD3);
+  double interDistanceD3 = d3.Length() / numObsD3;
+
+  pointAux.SetX(upperRightCoord.GetX());
+  for (int i = 0; i < numObsD3; i++) {
+    pointAux.SetY(upperRightCoord.GetY() - i * interDistanceD3);
+
+    //printf("D3, P(%d) = (%f,%f)\n", i, pointAux.GetX(), pointAux.GetY());
+    obstaclePoints.push_back(pointAux);
+  }
+
+  //Distance from bottom right to bottom left
+  CVector2 d4;
+  d4 = bottomRightCoord - bottomLeftCoord;
+  //printf("D4 %f\n", d4.Length());
+
+  double numObsD4;
+  modf(d4.Length() / (2 * OBSTACLE_RADIUS), &numObsD4);
+  double interDistanceD4 = d4.Length() / numObsD4;
+
+  pointAux.SetY(bottomRightCoord.GetY());
+  for (int i = 0; i < numObsD4; i++) {
+    pointAux.SetX(bottomRightCoord.GetX() - i * interDistanceD4);
+
+    //printf("D4, P(%d) = (%f,%f)\n", i, pointAux.GetX(), pointAux.GetY());
+    obstaclePoints.push_back(pointAux);
+  }
+
+  return obstaclePoints;
+
+}
+
+  void 
+MARSFootbot::setFixedObstacles(std::vector<CVector2> obstaclesPoints) 
+{
+  std::vector<CVector2>::iterator it;
+  for (unsigned int i = 0; i < obstaclesPoints.size(); i++) 
+  {
+    agent->addObstacleAtPoint(obstaclesPoints[i], OBSTACLE_RADIUS);
+  }
+}
+
+  void 
+MARSFootbot::updateNavigation() 
+{
+  if( m_state == STATE_ORIENTING )
+  {
+    CVector3 axis;
+    CRadians oA;
+    mySelf.getOrientation().ToAngleAxis(oA, axis);
+    if (axis.GetZ() < 0)
+      oA = -oA;
+    DEBUGNAV("STATE_ORIENTING: Current Orientation %f\n", ToDegrees(oA).GetValue());
+    //DEBUGNAV("[CONTROLLER] ID %d - ORIENTATION: (yaw) - (%f) - (%fº)\n", 
+	   //m_myID, oA.GetValue(), ToDegrees(oA).GetValue());
+    Real oAd = ToDegrees(oA).GetValue();
+    if ( oAd < 0 )
+      oAd = 360.0 + oAd;
+    /// now, make them between -PI and PI
+    if( oAd > 180.0)
+      oAd = oAd - 360.0;
+    /// distance between angles
+    Real cdev = m_targetOrientation - oAd;
+    cdev += (cdev>180) ? -360 : (cdev<-180) ? 360 : 0;
+
+//    agent->desideredAngle = ToRadians(CDegrees(m_targetOrientation)) - oA;
+
+    agent->desideredAngle = ToRadians(CDegrees(cdev));
+
+    DEBUGNAV("STATE_ORIENTING: desidered_angle %f\n", agent->desideredAngle.GetValue());
+    //if( agent->desideredAngle < 0 )
+     // agent->desideredAngle = CRadians::TWO_PI + agent->desideredAngle;
+//    agent->desideredAngle = CRadians::ZERO;
+    agent->desideredSpeed = 0;
+    agent->desideredVelocity = CVector2(0, 0);
+
+  }
+  else  if (m_state == STATE_ARRIVED_AT_TARGET) 
+  {
+    agent->desideredAngle = CRadians::ZERO;
+    agent->desideredSpeed = 0;
+    agent->desideredVelocity = CVector2(0, 0);
+  } 
+  else 
+  {
+    updateDesideredVelocity();
+  }
+  agent->updateVelocity();
+  updateVelocity();
+}
+
+  void 
+MARSFootbot::updateDesideredVelocity() 
+{
+  agent->targetPosition = m_targetPosition;
+  agent->updateDesideredVelocity();
+  //DEBUGNAV("=> desidered speed %.2f, desidered angle %.2f \n", 
+	   //agent->desideredSpeed, 
+	   //agent->desideredAngle.GetValue());
+}
+
+  void 
+MARSFootbot::updateVelocity() 
+{
+  //DEBUGNAV("%p: target wheel speed (%.3f %.3f) r %.3f\n", 
+	 //agent, 
+	 //agent->leftWheelTargetSpeed, 
+	 //agent->rightWheelTargetSpeed, 
+	 //agent->radius);
+  m_pcWheels->SetLinearVelocity(
+    100 * agent->leftWheelTargetSpeed / ODOMETRY_CORRECTION_FACTOR_LEFT, 
+    100 * agent->rightWheelTargetSpeed / ODOMETRY_CORRECTION_FACTOR_RIGHT);
+}
+
+  void 
+MARSFootbot::updateVelocityProximitySensors() 
+{
+  /* Get readings from proximity sensor */
+  const CCI_FootBotProximitySensor::TReadings& tProxReads = m_pcProximity->GetReadings();
+  /* Sum them together */
+  CVector2 cAccumulator;
+  for (size_t i = 0; i < tProxReads.size(); ++i) 
+  {
+    cAccumulator += CVector2(tProxReads[i].Value, tProxReads[i].Angle);
+  }
+  cAccumulator /= tProxReads.size();
+  /* If the angle of the vector is small enough and the closest obstacle is far enough,
+     continue going straight, otherwise curve a little */
+  CRadians cAngle = cAccumulator.Angle();
+  if (m_cGoStraightAngleRange.WithinMinBoundIncludedMaxBoundIncluded(cAngle) 
+      && cAccumulator.Length() < m_fDelta) 
+  {
+    /// Go straight 
+    //m_pcWheels->SetLinearVelocity(m_fWheelVelocity, m_fWheelVelocity);
+  } 
+  else 
+  {
+    /* Turn, depending on the sign of the angle */
+    if (cAngle.GetValue() > 0.0f) {
+      m_pcWheels->SetLinearVelocity(m_fWheelVelocity, 0.0f);
+    } else {
+      m_pcWheels->SetLinearVelocity(0.0f, m_fWheelVelocity);
+    }
+  }
+  /* Set LED colors */
+  m_ledsActuator->SetAllColors(CColor::BLACK);
+  cAngle.UnsignedNormalize();
+  UInt32 unIndex = static_cast<UInt32>(cAngle * 12.0f / CRadians::TWO_PI);
+  m_ledsActuator->SetSingleColor(unIndex, CColor::RED);
+}
+
+/**************************************/
+
+  void 
+MARSFootbot::Destroy() 
+{
+  DEBUG_CONTROLLER("MARSFootbot::Destroy (  )\n");
+}
+
+/**************************************/
+
+bool 
+MARSFootbot::IsControllerFinished() const 
+{
+  return false;
+}
+
+std::string
+MARSFootbot::getTimeStr()
+{
+#ifndef FOOTBOT_LQL_SIM
+  char buffer [80];
+  timeval curTime;
+  gettimeofday(&curTime, NULL);
+  int milli = curTime.tv_usec / 1000;
+  strftime(buffer, 80, "%Y-%m-%d %H:%M:%S", localtime(&curTime.tv_sec));
+  char currentTime[84] = "";
+  sprintf(currentTime, "%s:%d", buffer, milli);
+  std::string ctime_str(currentTime);
+  return ctime_str;
+#else
+  return "mytime";
+#endif
+}
+
+
+/// returns time in milliseconds
+  UInt64 
+MARSFootbot::getTime()
+{
+#ifndef FOOTBOT_LQL_SIM
+  struct timeval timestamp;
+  gettimeofday(&timestamp, NULL);
+
+  UInt64 ms1 = (UInt64) timestamp.tv_sec;
+  ms1*=1000;
+
+  UInt64 ms2 = (UInt64) timestamp.tv_usec;
+  ms2/=1000;
+
+  return (ms1+ms2);
+#else
+  return m_Steps * CPhysicsEngine::GetSimulationClockTick() * 1000;
+#endif
+}
+
+/// fills the buffer with a new msg content, taking into account the current packet size
+/// valid for both simulation and real
+void
+MARSFootbot::makeMsg()
+{
+  uint32_t bcnt = 0;
+  /// just to be sure that we are dealing with 32 bits
+  uint32_t sntpkt = (uint32_t)m_sentPackets;
+  char *cntptr = m_socketMsg;
+  /// put seqn (4)
+  memcpy(cntptr, &sntpkt, sizeof(sntpkt));
+  cntptr += sizeof(sntpkt);
+  bcnt += sizeof(sntpkt);
+  /// put timestamp (8) --!! will be rewritten by click at the moment that the packet was sent
+  uint64_t tstamp = getTime();
+  memcpy(cntptr, &tstamp, sizeof(tstamp));
+  cntptr += sizeof(tstamp);
+  bcnt += sizeof(tstamp);
+  /// put position (x,y) (8)
+  int32_t nx = (int32_t) ceil( position.GetX()*100.0);
+  int32_t ny = (int32_t) ceil( position.GetY()*100.0);
+  memcpy(cntptr,&nx, sizeof(nx));
+  cntptr += sizeof(nx);
+  bcnt += sizeof(nx);
+  memcpy(cntptr,&ny, sizeof(ny));
+  cntptr += sizeof(ny);
+  bcnt += sizeof(ny);
+  /// ----  add orientation (yaw) (4) ---
+  int32_t angle;
+  CVector3 axis;
+  CRadians oA;
+  mySelf.getOrientation().ToAngleAxis(oA, axis);
+  if (axis.GetZ() < 0)
+    oA = -oA;
+  angle = (int32_t) ceil(ToDegrees(oA).GetValue());
+  memcpy(cntptr,&angle, sizeof(angle));
+  cntptr += sizeof(angle);
+  bcnt += sizeof(angle);
+  ///reception time (8 bytes ) will be stored @ byte 24
+
+//  stringstream ss;
+//  ss << m_MyIdStr
+//    << " " << m_sentPackets
+ //   << " " << "END END";
+//  string msgstr = ss.str();
+//  memcpy(m_socketMsg, msgstr.c_str(), msgstr.size());
+
+  memset(cntptr, '1', m_packetSize-bcnt);
+//  for( int i=bcnt; i< m_packetSize; i++)
+//    m_socketMsg[i] = 'X';
+  m_socketMsg[m_packetSize] = '\0';
+  DEBUGCOMM("Composed MSG of size %d\n",
+	    m_packetSize);
+}
+
+
+/// ===========  only defined for REAL robots ======= //
+#ifndef FOOTBOT_LQL_SIM
+
+void
+MARSFootbot::GetNetMessages()
+{
+
+  struct sockaddr from;
+  int addr_len = sizeof(struct sockaddr_in);
+  int msg_size;
+  struct iphdr *ip;
+  struct udphdr *udp;
+  char *msg_data;
+
+  bool has_msgs = false;
+  while ( (msg_size = recv(m_recvSocket, m_rcvMsg, MAX_UDP_SOCKET_BUFFER_SIZE, MSG_DONTWAIT)) > 0 ) 
+  {
+    DEBUGCOMM("Got recv msg_size %d\n", msg_size);
+    /// Here, take only the packets generated by equal robotic controller
+    if ( msg_size != (m_packetSize + sizeof(struct iphdr) + sizeof(struct udphdr) ) )
+      continue;
+    ip = (struct iphdr*) m_rcvMsg;
+    udp = (struct udphdr*) (m_rcvMsg + sizeof(struct iphdr));
+    msg_data = (char *) (m_rcvMsg + sizeof(struct iphdr) + sizeof(struct udphdr) );
+    // printf("[%d] Received %d bytes from socket %d (TTL=%d): %s\n", Steps, msg_size, recvSocket,ip->ttl,msg_data);
+    //printf("%d,",65 - ip->ttl);
+
+    // printf("%s\t --> \t%s\n",
+    //                 inet_ntoa(*(struct in_addr*) &ip->saddr),
+    //                 inet_ntoa(*(struct in_addr *) &ip->daddr) );
+
+    //			std::cout << "*";
+    //			std::cout.flush();
+    //sscanf (msg_data,"%d %*s",&mSentDataPackets);
+    //printf("DECODED VALUE: %d\n",mSentDataPackets);
+    has_msgs = true;
+    m_receivedPacketsAll++;
+  }
+
+  if( has_msgs )
+  {
+    DEBUGCOMM("Got %d packets\n", m_receivedPacketsAll);
+    if( m_beaconMode == BEACON_RECEIVE_BLINK )
+    {
+      m_beaconActuator->SetColor(CColor::YELLOW);
+    }
+  }
+  else
+  {
+    if( m_beaconMode == BEACON_RECEIVE_BLINK )
+    {
+      m_beaconActuator->SetColor(CColor::BLACK);
+    }
+  }
+}
+
+
+  void
+MARSFootbot::updateClick()
+{
+  if( m_clickUpdateCounter )
+  {
+    m_clickUpdateCounter--;
+    return ;
+  }
+  m_clickUpdateCounter = CLICK_UPDATE_INTERVAL;
+  //printf("********** updating click ************ \n");
+  /*
+   * *************************************************
+   * update CLICK from unix socket
+   * *************************************************
+   */
+  /// Read distance info...
+  /// if we have our position
+  if( isNodeValid(mySelf) )
+  {
+    //DEBUGNAV("This node IS valid - timestamp %lu\n",mySelf.getTimestamp());
+    std::stringstream oss;
+    map<UInt8, Node>::iterator it;
+    CVector2 mypos;
+    mypos.Set( mySelf.getPosition().GetX(), mySelf.getPosition().GetY());
+    for (it = listNodeObstacles.begin(); it != listNodeObstacles.end(); it++) 
+    {
+      if ((it->second).getId() != mySelf.getId() 
+	  && isNodeValid(it->second) )
+      {
+	CVector2 otherpos;
+	otherpos.Set((it->second).getPosition().GetX(), (it->second).getPosition().GetY());
+	Real internode_distance = Distance(mypos, otherpos);
+	/// Distances in cm
+	oss << (it->second).getId() << " " << (int) ceil(internode_distance*100) << " ";
+	//printf("Adding obstacle : %d\n", (it->second).getId());
+      }
+
+    }
+    /// ... and send it to click
+    int nnbytes = snprintf(m_clickSocketBuffer, 
+			   MAX_UNIX_SOCKET_BUFFER_SIZE, 
+			   "WRITE lql.updateDistanceHandler %s\n", oss.str().c_str() );
+    int nbytes = write(m_clickSocket, m_clickSocketBuffer, nnbytes);
+    //printf("Written %d from %d bytes\n",nbytes,nnbytes);
+
+    nbytes = read(m_clickSocket, m_clickSocketBuffer, MAX_UNIX_SOCKET_BUFFER_SIZE);
+    //clickSocketBuffer[nbytes] = 0;
+    //printf("MESSAGE FROM SERVER: %s\n", clickSocketBuffer);
+  }
+  else
+  {
+    DEBUGNAV("This node is not valid - timestamp %lu\n",mySelf.getTimestamp());
+  }
+}
+
+
+  void 
+MARSFootbot::sendPacket(char *data, UInt32 size)
+{
+  //StepClock.start();
+
+  int r = sendto(m_sendSocket, 
+		 data, 
+		 size, 
+		 0, 
+		 (struct sockaddr *)&m_remote_addr, 
+		 sizeof(m_remote_addr));
+
+  if( r != size ) 
+  {
+    DEBUGERROR("Error while sending packet %s\n", strerror(errno));
+  } 
+  else 
+  {
+    // Count sent data
+    //mSentDataBytes += size;
+    //mSentDataPackets += 1;
+    DEBUGCOMM("Packet Sent!\n");
+    //printf("Packets sent %d (now: %d)\n", mSentDataPackets,r);
+  }
+}
+
+  void 
+MARSFootbot::sendTimerFired()
+{
+  if( m_imSending )
+  {
+    DEBUGCOMM("Sending packet %d @ %llu\n", 
+	      m_sentPackets, getTime());
+    makeMsg();
+    m_sentPackets++;
+    sendPacket(m_socketMsg, m_packetSize);
+  }
+}
+
+#ifndef FOOTBOT_LQL_SIM
+void
+MARSFootbot::toggleCBROnOff()
+{
+  if( m_imSending )
+  {
+    DEBUGCOMM("Toggle CBR OFF @ %llu\n",getTime());
+    stopSending();
+  }
+  else
+  {
+    DEBUGCOMM("Toggle CBR ON @ %llu\n",getTime());
+    startSending();
+  }
+
+  unsigned int cbr_interval = 
+    nextCBROnOffToggleInterval(); 
+  cout << "next interval in " << cbr_interval << endl;
+  m_cbrOnOffTimer->startOneShot(cbr_interval);
+}
+
+void
+MARSFootbot::cbrOnOffCB(void *arg)
+{
+  MARSFootbot * rt =
+    (MARSFootbot *) arg;
+  rt->toggleCBROnOff();
+}
+#endif
+
+void
+MARSFootbot::timerCB(void *arg)
+{
+  MARSFootbot * rt =
+    (MARSFootbot *) arg;
+  rt->sendTimerFired();
+}
+
+  void
+MARSFootbot::initClick()
+{
+  /*
+   * *************************************************
+   * Initialize Unix socket with CLICK
+   * *************************************************
+   */
+  m_clickSocket = socket(PF_UNIX, SOCK_STREAM, 0);
+  if(m_clickSocket < 0)
+  {
+    DEBUGERROR("Creating CLICK control socket: socket() failed\n");
+  } 
+  else 
+  {
+    /// start with a clean address structure
+    memset(&m_clickSocketAddress, 0, sizeof(struct sockaddr_un));
+
+    m_clickSocketAddress.sun_family = AF_UNIX;
+    snprintf(m_clickSocketAddress.sun_path, 32, "/tmp/clicksocket");
+
+    if(connect(m_clickSocket,
+	       (struct sockaddr *) &m_clickSocketAddress,
+	       sizeof(struct sockaddr_un)) != 0)
+    {
+      DEBUGERROR("Creating CLICK control socket: connect() failed\n");
+      close(m_clickSocket);
+      m_clickSocket = -1;
+    } else 
+    {
+      nbytes = read(m_clickSocket, m_clickSocketBuffer, MAX_UNIX_SOCKET_BUFFER_SIZE);
+      m_clickSocketBuffer[nbytes] = 0;
+
+      DEBUGCOMM("INITIAL MESSAGE FROM CLICK: %s\n", m_clickSocketBuffer);
+    }
+  }
+  m_clickUpdateCounter = CLICK_UPDATE_INTERVAL;
+}
+
+#endif
+
+REGISTER_CONTROLLER(MARSFootbot, "footbot_lql_collector")
+
