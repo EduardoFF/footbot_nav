@@ -1,0 +1,109 @@
+<ahss-config>
+
+  <!-- *************** -->
+  <!-- * Controllers * -->
+  <!-- *************** -->
+  <controllers>
+
+    <!-- 
+	 Here you list the controllers to be used in the experiment.
+	 The XML tag is set by the REGISTER_CONTROLLER(class, "tag") macro.
+	 You find it in the .cpp file of your controller.
+	 For this example, the macro is called in controllers/footbot_diffusion.cpp:100.
+    -->
+
+    <!--
+	The attributes are:
+	- id: a unique a identifier for this controller, to be used in the subsequent
+	<arena> section to say which robots use which controller
+	- library: the path to the compiled library containing you controller.
+    -->
+    <lqlcollect id="footbot_nav"
+      library="build/controllers/footbot_navigator/footbot_navigator.so">
+      <!--
+	  The <actuators> section contains a list of the actuators used by this controller.
+	  If you forget a to mention an actuator here and then request it in the controller,
+	  an error occurs.
+	  For a list of the possible actuators, type at the command prompt:
+	  $ launch_argos -q actuators
+
+Multiple implementations of an actuator are possible. To identify which one
+you want to use, pass it in the 'implementation' attribute below. When you
+type the 'argos -q' command, the implementation is in the square brackets
+following the name of the device:
+
+$ launch_argos -q actuators
+...
+footbot_wheels [default]
+...
+      -->
+      <actuators>
+	<footbot_wheels implementation="default" />
+	<footbot_leds   implementation="default" />
+	<footbot_beacon/>
+      </actuators>
+      <!--
+	  The <sensors> section contains a list of the sensors used by this controller.
+	  If you forget a to mention a sensor here and then request it in the controller,
+	  an error occurs.
+	  For a list of the possible sensors, type at the command prompt:
+	  $ launch_argos -q sensors
+      -->
+      <sensors>
+	<footbot_proximity calibrated='true' low_level_config='/home/root/jerome/proximity_config.xml'/>
+	<footbot_proximity implementation="rot_z_only" show_rays="true" calibrate="true" />
+	<footbot_encoder implementation="default"/>
+      </sensors>
+      <!--
+	  The <parameters> section is passed as-is to the controller's Init() function.
+	  The user, writing the controller, defines how it is organized.
+	  To understand what these parameters are for, check the controller's header file in
+	  controllers/footbot_diffusion/footbot_diffusion.h.
+      -->
+      <parameters Random_Seed="98765" alpha="7.5" delta="0.001" velocity="10" interval="10" generators="0.4">
+	<lcm track="TRACK" />
+	<!--<comm trafficGenType="TRAFFIC_CBR_ONOFF" />-->
+	<comm trafficGenType="TRAFFIC_NONE" cbrPacketInterval="50"/>
+	<ledcontrol mode="NONE" fixedColor="blue"/>
+	<beaconcontrol mode="MOBILITY_LETTER_DEMO" fixedColor="red"/>
+	<optimalSpeed>0.2</optimalSpeed>
+	<safetyMargin>0.1</safetyMargin>
+	<socialMargin>0.1</socialMargin>
+	<resolution>201</resolution>
+	<horizon>5</horizon>
+	<timeHorizon>5.0</timeHorizon>
+	<aperture>3.2</aperture>
+	<tau>0.125</tau>
+	<eta>0.5</eta>
+	<local_navigation type="HL" NH="true" doTargetOrientation="false" targetOrientation="90.0"/>
+	<rotationTau>0.5</rotationTau>
+	<experiment name="Demo" duration="3000000" log="false"/>					
+	<mySensors>
+	  <!--><footbot_front_camera implementation="default" low_level_config="/home/root/jerome/camera_config.xml" show_rays="false"/><-->
+	</mySensors>
+	<debug>
+	  <camera active="false"/>
+	  <console active="false"/>
+	  <mode active="false"/>
+	  <udp active="false" address="10.0.0.2"/>
+	</debug>
+	<path order='asc' dist='0.05'></path>
+	<active_sensors gyroscope="false" rab="false" proximity="false" ground="false" distance_scanner="false"/>
+	<mobility rotation_max_speed='0.1' continuous='false'/>
+	<led_debugging leds="true" beacon="true" beacon_intensity="10"/>
+	<rab min_particle_separation="0.4" particle_age="5.0" min_particle_confidence="0.1"/>
+	<!-- Min distance from the current position to the target position to determine it this is reached (meters)-->
+	<targetMinPointDistance>0.05</targetMinPointDistance>
+	<!-- Area bounds -->
+	<originAreaX>-10.0</originAreaX>
+	<originAreaY>-10.0</originAreaY>
+	<destinationAreaX>10.0</destinationAreaX>
+	<destinationAreaY>10.5</destinationAreaY>
+      </parameters>
+
+    </lqlcollect>
+
+  </controllers>
+
+
+</ahss-config>
